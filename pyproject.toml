@@ -5,8 +5,20 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "aiohttp>=3.12.15",
+    "asyncio>=4.0.0",
+    "loguru>=0.7.3",
+    "matplotlib>=3.10.6",
+    "numpy>=2.3.2",
     "pandas>=2.3.2",
+    "plotly>=6.3.0",
+    "pytest>=8.4.2",
+    "pytest-asyncio>=1.1.0",
     "python-binance>=1.0.29",
     "python-dotenv>=1.1.1",
+    "schedule>=1.2.2",
+    "slack-bolt>=1.25.0",
+    "slack-sdk>=3.36.0",
     "supabase>=2.18.1",
+    "ta-lib>=0.6.7",
 ]
