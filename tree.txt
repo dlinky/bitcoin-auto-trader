@@ -20,3 +20,6 @@ crypto-auto-trader/
 ├── tests/
 ├── logs/
 └── requirements.txt
+
+
+

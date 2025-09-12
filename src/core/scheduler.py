@@ -7,11 +7,12 @@
 import schedule
 import time
 import threading
+import logging
 from datetime import datetime
 from typing import Dict, List, Optional, Callable
 
-from utils.logger import get_logger
-from utils.slack_handler import setup_global_slack_logging
+from src.utils.logger import get_logger
+from src.utils.slack_handler import setup_global_slack_logging
 
 logger = get_logger(__name__)
 
