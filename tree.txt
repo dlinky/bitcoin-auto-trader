@@ -1,0 +1,22 @@
+crypto-auto-trader/
+├── src/
+│   ├── core/
+│   │   ├── trader.py
+│   │   ├── strategy.py
+│   │   └── risk_manager.py
+│   ├── api/
+│   │   ├── binance_client.py
+│   │   └── supabase_client.py
+│   ├── strategies/
+│   │   └── moving_average.py
+│   ├── monitoring/
+│   │   └── slack_bot.py
+│   └── utils/
+│       ├── logger.py
+│       └── config.py
+├── config/
+│   ├── .env.example
+│   └── database_schema.sql
+├── tests/
+├── logs/
+└── requirements.txt

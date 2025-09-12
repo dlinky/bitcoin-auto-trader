@@ -5,8 +5,9 @@ from binance.client import Client
 from binance.exceptions import BinanceAPIException, BinanceRequestException
 import pandas as pd
 from decimal import Decimal, ROUND_DOWN
+from src.utils.logger import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 class BinanceClient:
     """바이낸스 선물 거래를 위한 클라이언트"""

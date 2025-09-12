@@ -5,6 +5,7 @@
 - [설치 및 설정](#설치-및-설정)
 - [모듈별 문서](#모듈별-문서)
     - [BinanceClient](#binanceclient)
+    - [SupabaseClient](#supabaseclient)
     - [Strategy](#Strategy)
     - [Trader](#Trader)
     - [DataCollector](#DataCollector)
@@ -45,26 +46,26 @@ uv add slack-sdk schedule loguru numpy ta-lib
 # 모듈별 문서
 ## BinanceClient
 바이낸스 선물 거래를 위한 API 클라이언트 모듈
-## 📁 파일 위치
+### 📁 파일 위치
 ```
 src/api/binance_client.py
 ```
-## 🚀 주요 기능
+### 🚀 주요 기능
 - **OHLCV 데이터 조회**: 캔들스틱 데이터를 pandas DataFrame으로 반환
 - **포지션 관리**: 현재 포지션 정보 조회 및 상태 확인
 - **주문 실행**: 시장가 매수/매도 주문
 - **계좌 조회**: USDT 잔고 및 사용 가능 금액 확인
 - **심볼 정보**: 최소 주문 단위 등 거래 규칙 조회
 - **수량 계산**: USDT 금액 기준 주문 수량 자동 계산
-## ⚙️ 설정 요구사항
-### 환경변수 (config/.env)
+### ⚙️ 설정 요구사항
+#### 환경변수 (config/.env)
 ```env
 BINANCE_API_KEY=your_api_key
 BINANCE_API_SECRET=your_secret_key
 BINANCE_TESTNET=true
 ```
-## 💻 사용 방법
-### 기본 초기화
+### 💻 사용 방법
+#### 기본 초기화
 ```python
 from src.api.binance_client import BinanceClient
 
@@ -74,38 +75,38 @@ client = BinanceClient(
     testnet=True
 )
 ```
-### 주요 메서드 사용 예시
-#### 1. 캔들 데이터 조회
+#### 주요 메서드 사용 예시
+##### 1. 캔들 데이터 조회
 ```python
 df = client.get_klines('BTCUSDT', '1m', 100)
 print(df.tail())
 ```
-#### 2. 포지션 확인
+##### 2. 포지션 확인
 ```python
 position = client.get_position_info('BTCUSDT')
 print(f"포지션: {position['side']} {position['size']}")
 ```
-#### 3. 주문 실행
+##### 3. 주문 실행
 ```python
 current_price = df.iloc[-1]['close']
 quantity = client.calculate_quentity('BTCUSDT', 50, current_price)
 order = client.place_market_order('BTCUSDT', 'BUY', quantity)
 ```
-#### 4. 계좌 잔고 확인
+##### 4. 계좌 잔고 확인
 ```python
 balance = client.get_account_balance()
 print(f"사용 가능: {balance['available']} USDT")
 ```
-## 🛡️ 에러 처리
+### 🛡️ 에러 처리
 - 재시도 로직: API 실패 시 1회 자동 재시도
 - 타임아웃: 5초
 - 로깅: 모든 API 호출 및 에러 로그 기록
-## 🧪 테스트
-### 테스트 실행
+### 🧪 테스트
+#### 테스트 실행
 ```bash
 python test_binance_client.py
 ```
-### 테스트 내용
+#### 테스트 내용
 - ✅ API 연결 확인
 - ✅ 계좌 잔고 조회
 - ✅ 심볼 정보 조회
@@ -113,22 +114,22 @@ python test_binance_client.py
 - ✅ 포지션 정보 확인
 - ✅ 주문 수량 계산
 - ✅ 에러 처리 동작
-## ⚠️ 주의사항
+### ⚠️ 주의사항
 - 테스트넷 사용 권장
 - 바이낸스 API Rate Limit 준수
 - API 키는 환경변수로 관리하며, .env 파일을 Git에 커밋하지 않도록 주의
-## 🔗 연동 객체
+### 🔗 연동 객체
 - Trader: 포지션 관리 및 주문 실행
 - DataCollector: OHLCV 데이터 수집
 - RiskManager: 주문 전 리스크 검증
 - SlackBot: 거래 알림 전송
-## 📈 데이터 형식
-### 캔들 데이터 (DataFrame)
+### 📈 데이터 형식
+#### 캔들 데이터 (DataFrame)
 ```python
    timestamp              open     high     low      close     volume
 0  2025-01-01 00:00:00    95000.0  95100.0  94900.0  95050.0   1234.56
 ```
-### 포지션 정보 (Dict)
+#### 포지션 정보 (Dict)
 ```python
 {
     'symbol': 'BTCUSDT',
@@ -138,7 +139,7 @@ python test_binance_client.py
     'side': 'LONG'           # LONG/SHORT/NONE
 }
 ```
-### 주문 결과 (Dict)
+#### 주문 결과 (Dict)
 ```python
 {
     'order_id': 123456789,
@@ -149,3 +150,52 @@ python test_binance_client.py
     'status': 'FILLED',
     'time': pd.Timestamp('2025-01-01 00:00:00')
 }
+```
+## SupabaseClient
+### 📁 파일 위치
+```
+src/api/supabase_client.py
+```
+### 🚀 주요 기능
+- **로그 저장**: save_log() - system_logs 테이블에 저장
+- **시장 데이터**: save_market_data(), get_latest_market_data()
+- **캔들 관리**: get_missing_candles_count() - 부족한 캔들 개수 확인
+- **거래 내역**: save_trade(), 트레이더 정보 관리
+- **에러 처리**: 모든 메서드에 try-catch 적용
+### 💻 사용 방법
+#### 기본 초기화
+```python
+client = SupabaseClient()
+```
+#### 주요 메서드 사용 예시
+```python
+❓ datacollection, trader 등 만들어지는것 보면서 작성 필요
+```
+## Logger
+### 📁 파일 위치
+```
+src/utils/logger.py
+```
+### 🚀 주요 기능
+- **수준별 로그 분류**: 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'
+- **로그 출력 매체 설정**: 파일, 콘솔 설정 가능
+### ⚙️ 설정 요구사항
+#### 환경변수 (config/.env)
+```env
+LOG_LEVEL=['DEBUG','INFO']
+```
+### 💻 사용 방법
+#### 기본 초기화
+```python
+from src.utils.logger import get_logger
+
+logger = get_logger(__name__)
+```
+#### 수준별 로그 사용
+```python
+logger.debug("🔍 DEBUG 메시지 - 상세한 디버그 정보")
+logger.info("ℹ️ INFO 메시지 - 일반 정보")
+logger.warning("⚠️ WARNING 메시지 - 경고")
+logger.error("❌ ERROR 메시지 - 에러 발생")
+logger.critical("🚨 CRITICAL 메시지 - 심각한 오류")
+```
