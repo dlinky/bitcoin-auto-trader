@@ -11,7 +11,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 # 프로젝트 루트를 sys.path에 추가
-project_root = Path(__file__).parent
+project_root = Path(__file__).parent.parent
 sys.path.append(str(project_root))
 
 from src.utils.logger import get_logger, setup_logger, log_function_call

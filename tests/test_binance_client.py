@@ -11,7 +11,8 @@ from datetime import datetime
 from dotenv import load_dotenv
 
 # 프로젝트 루트를 sys.path에 추가
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+project_root = Path(__file__).parent.parent
+sys.path.append(str(project_root))
 
 from src.api.binance_client import BinanceClient
 

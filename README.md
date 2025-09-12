@@ -9,10 +9,10 @@
     - [Strategy](#Strategy)
     - [Trader](#Trader)
     - [DataCollector](#DataCollector)
-    - [Scheduler](#Scheduler)
-    - [RiskManager](#RiskManager)
-    - [TradingSystem](#TradingSystem)
-    - [SlackBot](#SlackBot)
+    - [ ][Scheduler](#Scheduler)
+    - [ ][RiskManager](#RiskManager)
+    - [ ][TradingSystem](#TradingSystem)
+    - [ ][SlackBot](#SlackBot)
     - [Logger](#Logger)
 ---
 
@@ -171,6 +171,29 @@ client = SupabaseClient()
 ```python
 ❓ datacollection, trader 등 만들어지는것 보면서 작성 필요
 ```
+
+## DataCollector
+### 📁 파일 위치
+```
+src/core/data_collector.py
+```
+### 🚀 주요 기능
+- **캔들데이터 수집**: 각 심볼 1분봉 수집하여 db에 저장
+- **지표 계산**: MACD, ATR 등 필요한 지표 계산 및 저장
+- **결측치 보완**: 서버 오류 등으로 데이터 결측 시 재수집하여 저장
+
+### 💻 사용 방법
+#### 기본 초기화
+```python
+collector = DataCollector(binance_client, supabase_client, ['symbols'])
+```
+#### 주요 메서드 사용
+```python
+collector.ensure_historical_data('BTCUSDT', 200)
+results = collector.collect_all_symbols_concurrent()
+```
+
+
 ## Logger
 ### 📁 파일 위치
 ```
