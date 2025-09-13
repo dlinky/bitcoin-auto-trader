@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-암호화폐 자동매매 메인 시스템 (알림 통합 버전)
+암호화폐 자동매매 메인 시스템 (알림 통합 + Slack 명령어 버전)
 파일 위치: main_with_notifications.py
 """
 
@@ -17,6 +17,7 @@ sys.path.append(str(project_root))
 
 from src.api.binance_client import BinanceClient
 from src.api.supabase_client import SupabaseClient
+from src.api.slack_client import SlackClient  # 추가
 from src.core.data_collector import DataCollector
 from src.core.trader import Trader
 from src.core.notification_manager import NotificationManager
@@ -28,13 +29,14 @@ from src.utils.logger import get_logger
 logger = get_logger(__name__)
 
 class IntegratedTradingSystem:
-    """통합된 자동매매 시스템"""
+    """통합된 자동매매 시스템 (Slack 명령어 지원)"""
     
     def __init__(self):
         """시스템 초기화"""
         self.binance_client = None
         self.supabase_client = None
         self.notification_manager = None
+        self.slack_client = None  # 추가
         self.data_collector = None
         self.scheduler = None
         self.traders = []
@@ -78,7 +80,17 @@ class IntegratedTradingSystem:
             logger.info("NotificationManager 초기화...")
             self.notification_manager = NotificationManager(self.supabase_client)
             
-            # 5. DataCollector 초기화
+            # 5. Slack 명령어 처리 클라이언트 초기화 (추가)
+            logger.info("Slack 명령어 클라이언트 초기화...")
+            try:
+                self.slack_client = SlackClient()
+                self.slack_client.setup_command_handler(self.supabase_client, self.notification_manager)
+                logger.info("Slack 명령어 처리기 설정 완료")
+            except Exception as e:
+                logger.warning(f"Slack 명령어 클라이언트 초기화 실패: {e}")
+                logger.warning("명령어 기능 없이 계속 진행합니다")
+            
+            # 6. DataCollector 초기화
             logger.info("DataCollector 초기화...")
             symbols = ['BTCUSDT']  # 초기 심볼
             self.data_collector = DataCollector(
@@ -87,12 +99,12 @@ class IntegratedTradingSystem:
                 symbols
             )
             
-            # 6. 트레이더 초기화
+            # 7. 트레이더 초기화
             logger.info("트레이더 초기화...")
             if not self._initialize_traders():
                 return False
             
-            # 7. 스케줄러 초기화 (NotificationManager 포함)
+            # 8. 스케줄러 초기화 (NotificationManager 포함)
             logger.info("스케줄러 초기화...")
             self.scheduler = EnhancedScheduler(self.notification_manager)
             
@@ -157,14 +169,22 @@ class IntegratedTradingSystem:
                 logger.error("스케줄러 시작 실패")
                 return False
             
-            # 2. 과거 데이터 보완
+            # 2. Slack 메시지 수신 시작 (추가)
+            if self.slack_client:
+                logger.info("Slack 메시지 수신 시작...")
+                if self.slack_client.start_listening():
+                    logger.info("Slack 명령어 처리 활성화됨")
+                else:
+                    logger.warning("Slack 메시지 수신 시작 실패")
+            
+            # 3. 과거 데이터 보완
             logger.info("과거 데이터 보완 중...")
             for symbol in self.data_collector.symbols:
                 success = self.data_collector.ensure_historical_data(symbol, 200)
                 if not success:
                     logger.warning(f"{symbol} 과거 데이터 보완 실패")
             
-            # 3. 스케줄 작업 등록
+            # 4. 스케줄 작업 등록
             
             # 데이터 수집 작업 (매분)
             self.scheduler.add_data_collection_job(
@@ -191,20 +211,33 @@ class IntegratedTradingSystem:
                     'errors_today': 0
                 })
                 
-                # 시작 알림
+                # 시작 알림 (Slack 명령어 사용법 포함)
+                start_message = f"""🚀 자동매매 시스템이 시작되었습니다!
+
+📊 **시스템 정보**
+• 활성 트레이더: {len(self.traders)}개
+• 대상 심볼: {', '.join(self.data_collector.symbols)}
+• 시작 시간: {time.strftime('%Y-%m-%d %H:%M:%S')}
+
+🤖 **사용 가능한 명령어**
+• `status` - 시스템 상태 조회
+• `traders` - 트레이더 목록
+• `position BTCUSDT` - 포지션 조회
+• `pnl today` - 수익률 조회
+• `help` - 전체 명령어 목록
+
+💡 명령어는 일반 텍스트로 입력하세요 (예: `status`)"""
+                
                 self.notification_manager.send_error_alert(
-                    "🚀 자동매매 시스템이 시작되었습니다!",
+                    start_message,
                     "integrated_trading_system",
                     "INFO",
-                    {
-                        "active_traders": len(self.traders),
-                        "symbols": self.data_collector.symbols,
-                        "start_time": time.strftime('%Y-%m-%d %H:%M:%S')
-                    },
+                    None,
                     throttle=False  # 시작 알림은 스팸 방지 무시
                 )
             
             logger.info(f"자동매매 시스템 시작 완료! (트레이더: {len(self.traders)}개)")
+            logger.info("Slack에서 'status' 명령어로 시스템 상태를 확인할 수 있습니다")
             return True
             
         except Exception as e:
@@ -233,6 +266,11 @@ class IntegratedTradingSystem:
                     throttle=False
                 )
             
+            # Slack 메시지 수신 정지 (추가)
+            if self.slack_client:
+                logger.info("Slack 메시지 수신 정지...")
+                self.slack_client.stop_listening()
+            
             # 스케줄러 정지 (NotificationManager도 함께 정지됨)
             if self.scheduler:
                 self.scheduler.stop()
@@ -250,6 +288,7 @@ class IntegratedTradingSystem:
             'running': self.is_running,
             'traders_count': len(self.traders),
             'symbols': self.data_collector.symbols if self.data_collector else [],
+            'slack_commands_enabled': self.slack_client is not None,  # 추가
         }
         
         if self.scheduler:
@@ -257,6 +296,9 @@ class IntegratedTradingSystem:
         
         if self.notification_manager:
             status['notifications'] = self.notification_manager.get_notification_status()
+        
+        if self.slack_client:  # 추가
+            status['slack_listening'] = getattr(self.slack_client, 'is_listening', False)
         
         return status
     
@@ -304,6 +346,11 @@ def main():
         # 메인 루프
         logger.info("메인 루프 시작 - 시스템이 백그라운드에서 실행됩니다")
         logger.info("정지하려면 Ctrl+C를 누르세요")
+        logger.info("")
+        logger.info("💡 Slack에서 다음 명령어들을 사용할 수 있습니다:")
+        logger.info("   • status - 시스템 상태")
+        logger.info("   • traders - 트레이더 목록") 
+        logger.info("   • help - 전체 명령어")
         
         # 상태 출력 (10분마다)
         last_status_time = time.time()
@@ -317,7 +364,8 @@ def main():
                 current_time = time.time()
                 if current_time - last_status_time >= status_interval:
                     status = trading_system.get_system_status()
-                    logger.info(f"시스템 상태: 실행 중 (트레이더: {status['traders_count']}개)")
+                    slack_status = "활성화됨" if status.get('slack_commands_enabled') else "비활성화됨"
+                    logger.info(f"시스템 상태: 실행 중 (트레이더: {status['traders_count']}개, Slack 명령어: {slack_status})")
                     last_status_time = current_time
                 
             except KeyboardInterrupt:
@@ -339,7 +387,7 @@ def main():
 
 if __name__ == "__main__":
     """
-    통합된 자동매매 시스템 실행
+    통합된 자동매매 시스템 실행 (Slack 명령어 지원)
     
     필요한 환경변수 (config/.env):
     - BINANCE_API_KEY=your_api_key
@@ -351,7 +399,7 @@ if __name__ == "__main__":
     """
     
     print("=" * 60)
-    print("🚀 암호화폐 자동매매 시스템 (알림 통합 버전)")
+    print("🚀 암호화폐 자동매매 시스템 (알림 + 명령어 통합 버전)")
     print("=" * 60)
     print()
     
@@ -384,6 +432,7 @@ if __name__ == "__main__":
         sys.exit(1)
     
     print("✅ 모든 환경변수 설정 완료")
+    print("🔧 Slack 명령어 지원 활성화")
     print()
     
     # 메인 함수 실행

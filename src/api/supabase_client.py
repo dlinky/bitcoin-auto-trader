@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Supabase 클라이언트 모듈 (새로 작성)
+Supabase 클라이언트 모듈 (datetime 직렬화 오류 수정)
 파일 위치: src/api/supabase_client.py
 """
 
@@ -39,6 +39,12 @@ class SupabaseClient:
             raise Exception("데이터베이스 검증 실패. 스키마를 확인하거나 생성하세요.")
         
         logger.info("Supabase 클라이언트 초기화 완료")
+    
+    def _datetime_to_string(self, dt: datetime) -> str:
+        """datetime 객체를 ISO 문자열로 변환"""
+        if isinstance(dt, datetime):
+            return dt.isoformat()
+        return dt
     
     def _validate_database(self) -> bool:
         """데이터베이스 구조 검증"""
@@ -165,7 +171,7 @@ class SupabaseClient:
                 'message': message,
                 'trader_id': trader_id,
                 'data': data,
-                'created_at': datetime.now().isoformat()
+                'created_at': self._datetime_to_string(datetime.now())
             }
             
             response = self.client.table('system_logs').insert(log_data).execute()
@@ -181,23 +187,10 @@ class SupabaseClient:
     
     def save_market_data_batch(self, market_data_list: List[Dict]) -> bool:
         """
-        시장 데이터 배치 저장 (Upsert 방식)
+        시장 데이터 배치 저장 (디버깅 강화 버전)
         
         Args:
             market_data_list: 시장 데이터 리스트
-            [
-                {
-                    'symbol': 'BTCUSDT',
-                    'timestamp': datetime,
-                    'open': 95000.0,
-                    'high': 95100.0,
-                    'low': 94900.0,
-                    'close': 95050.0,
-                    'volume': 1234.56,
-                    'macd_12_26_9_line': 123.45,  # 지표 (옵션)
-                    'atr_14_value': 67.89         # 지표 (옵션)
-                }
-            ]
             
         Returns:
             저장 성공 여부
@@ -207,40 +200,74 @@ class SupabaseClient:
                 logger.warning("저장할 시장 데이터가 없습니다")
                 return True
             
-            # 데이터 형식 변환
+            logger.info(f"[DEBUG] 배치 저장 시작: {len(market_data_list)}개")
+            
+            # 데이터 형식 변환 및 datetime 직렬화
             processed_data = []
-            for data in market_data_list:
-                processed_row = {
-                    'symbol': data['symbol'],
-                    'timestamp': data['timestamp'].isoformat() if isinstance(data['timestamp'], datetime) else data['timestamp'],
-                    'open': float(data['open']),
-                    'high': float(data['high']),
-                    'low': float(data['low']),
-                    'close': float(data['close']),
-                    'volume': float(data['volume'])
-                }
-                
-                # 지표 데이터 추가 (있는 경우만)
-                for key, value in data.items():
-                    if key not in ['symbol', 'timestamp', 'open', 'high', 'low', 'close', 'volume']:
-                        if value is not None:
-                            processed_row[key] = float(value)
-                
-                processed_data.append(processed_row)
+            for i, data in enumerate(market_data_list):
+                try:
+                    processed_row = {
+                        'symbol': data['symbol'],
+                        'timestamp': self._datetime_to_string(data['timestamp']),
+                        'open': float(data['open']),
+                        'high': float(data['high']),
+                        'low': float(data['low']),
+                        'close': float(data['close']),
+                        'volume': float(data['volume'])
+                    }
+                    
+                    # 지표 데이터 추가 (있는 경우만)
+                    for key, value in data.items():
+                        if key not in ['symbol', 'timestamp', 'open', 'high', 'low', 'close', 'volume']:
+                            if value is not None:
+                                processed_row[key] = float(value)
+                    
+                    processed_data.append(processed_row)
+                    
+                except Exception as e:
+                    logger.error(f"[DEBUG] 데이터 변환 실패 (인덱스 {i}): {e}")
+                    logger.error(f"[DEBUG] 문제 데이터: {data}")
+                    continue
+            
+            if not processed_data:
+                logger.error("[DEBUG] 변환된 데이터가 없습니다")
+                return False
+            
+            logger.info(f"[DEBUG] 변환 완료: {len(processed_data)}개")
+            logger.info(f"[DEBUG] 첫 번째 데이터: {processed_data[0]}")
+            
             
             # Upsert로 배치 저장
-            response = self.client.table('market_data').upsert(
-                processed_data,
-                on_conflict='symbol,timestamp'
-            ).execute()
-            
-            success_count = len(response.data) if response.data else 0
-            logger.info(f"시장 데이터 배치 저장 완료: {success_count}개")
-            
-            return success_count > 0
+            try:
+                response = self.client.table('market_data').upsert(
+                    processed_data,
+                    on_conflict='symbol,timestamp'
+                ).execute()
+                
+                success_count = len(response.data) if response.data else 0
+                logger.info(f"[DEBUG] Supabase 응답: {success_count}개 저장됨")
+                
+                if success_count != len(processed_data):
+                    logger.warning(f"[DEBUG] 저장 불일치: 요청 {len(processed_data)}개, 실제 {success_count}개")
+                    
+                    # 일부만 저장된 경우 저장된 데이터 확인
+                    if response.data:
+                        logger.info(f"[DEBUG] 실제 저장된 첫 번째: {response.data[0]}")
+                        logger.info(f"[DEBUG] 실제 저장된 마지막: {response.data[-1]}")
+                
+                return success_count > 0
+                
+            except Exception as upsert_error:
+                logger.error(f"[DEBUG] Upsert 실행 실패: {upsert_error}")
+                logger.error(f"[DEBUG] 데이터 타입 확인:")
+                for key, value in processed_data[0].items():
+                    logger.error(f"[DEBUG]   {key}: {type(value)} = {value}")
+                return False
             
         except Exception as e:
-            logger.error(f"시장 데이터 배치 저장 중 에러: {e}")
+            logger.error(f"[DEBUG] 배치 저장 전체 실패: {e}")
+            import traceback
+            logger.error(f"[DEBUG] 스택 트레이스: {traceback.format_exc()}")
             return False
     
     def save_market_data(self, symbol: str, timestamp: datetime, 
@@ -326,9 +353,9 @@ class SupabaseClient:
             response = self.client.table('market_data').select(
                 'timestamp'
             ).eq('symbol', symbol).gte(
-                'timestamp', start_time.isoformat()
+                'timestamp', self._datetime_to_string(start_time)
             ).lte(
-                'timestamp', current_minute.isoformat()
+                'timestamp', self._datetime_to_string(current_minute)
             ).order('timestamp', desc=False).execute()
             
             existing_times = []
@@ -398,7 +425,170 @@ class SupabaseClient:
         except Exception as e:
             logger.error(f"최근 캔들 시간 조회 중 에러: {e}")
             return None
+
+    def get_collection_strategy(self, symbol: str, required_count: int = 200) -> Dict:
+        """
+        데이터 수집 전략 반환 (디버깅 버전)
+        
+        Args:
+            symbol: 거래 심볼
+            required_count: 필요한 캔들 개수
+            
+        Returns:
+            수집 전략 딕셔너리
+        """
+        try:
+            now = datetime.now().replace(second=0, microsecond=0)
+            target_start = now - timedelta(minutes=required_count - 1)
+            
+            logger.info(f"[DEBUG] {symbol} 시간 계산:")
+            logger.info(f"[DEBUG] 현재 시간: {now}")
+            logger.info(f"[DEBUG] 목표 시작: {target_start}")
+            logger.info(f"[DEBUG] 필요 개수: {required_count}")
+            
+            # 기존 데이터 개수 및 범위 확인
+            response = self.client.table('market_data').select(
+                'timestamp'
+            ).eq('symbol', symbol).gte(
+                'timestamp', self._datetime_to_string(target_start)
+            ).lte(
+                'timestamp', self._datetime_to_string(now)
+            ).order('timestamp').execute()
+            
+            existing_count = len(response.data) if response.data else 0
+            logger.info(f"[DEBUG] {symbol} 기존 데이터: {existing_count}개")
+            
+            # 전략 결정
+            if existing_count == 0:
+                # 전체 수집 필요
+                chunks = self._create_collection_chunks(target_start, required_count)
+                logger.info(f"[DEBUG] {symbol} 전략: 전체 수집, 청크 {len(chunks)}개")
+                
+                # 첫 번째 청크 로깅
+                if chunks:
+                    logger.info(f"[DEBUG] 첫 번째 청크: {chunks[0]}")
+                
+                return {
+                    'strategy': 'bulk_collect',
+                    'total_needed': required_count,
+                    'chunks': chunks,
+                    'existing_count': 0
+                }
+            
+            elif existing_count >= required_count * 0.95:  # 95% 이상 있으면
+                # 최신 데이터만 보완
+                latest_time = datetime.fromisoformat(
+                    response.data[-1]['timestamp'].replace('Z', '+00:00')
+                ).replace(tzinfo=None)
+                
+                minutes_gap = int((now - latest_time).total_seconds() / 60)
+                
+                logger.info(f"[DEBUG] {symbol} 최신 시간: {latest_time}, 갭: {minutes_gap}분")
+                
+                if minutes_gap <= 10:  # 10분 이내면 최신 상태
+                    return {
+                        'strategy': 'up_to_date',
+                        'total_needed': 0,
+                        'chunks': [],
+                        'existing_count': existing_count
+                    }
+                else:
+                    chunks = [{'start_time': latest_time + timedelta(minutes=1), 'count': minutes_gap}]
+                    logger.info(f"[DEBUG] {symbol} 갭 보완: {chunks}")
+                    
+                    return {
+                        'strategy': 'fill_gaps',
+                        'total_needed': minutes_gap,
+                        'chunks': chunks,
+                        'existing_count': existing_count
+                    }
+            
+            else:
+                # 부분적 보완
+                needed = required_count - existing_count
+                chunks = self._create_collection_chunks(target_start, needed)
+                
+                logger.info(f"[DEBUG] {symbol} 부분 보완: {needed}개 필요, 청크 {len(chunks)}개")
+                if chunks:
+                    logger.info(f"[DEBUG] 첫 번째 청크: {chunks[0]}")
+                
+                return {
+                    'strategy': 'fill_gaps',
+                    'total_needed': needed,
+                    'chunks': chunks,
+                    'existing_count': existing_count
+                }
+                
+        except Exception as e:
+            logger.error(f"[DEBUG] 수집 전략 생성 실패: {e}")
+            # 실패시 전체 수집 전략 반환
+            now_fallback = datetime.now()
+            target_start_fallback = now_fallback - timedelta(minutes=required_count)
+            
+            return {
+                'strategy': 'bulk_collect',
+                'total_needed': required_count,
+                'chunks': self._create_collection_chunks(target_start_fallback, required_count),
+                'existing_count': 0
+            }
     
+    def _create_collection_chunks(self, start_time: datetime, total_count: int) -> List[Dict]:
+        """
+        수집 청크 생성 (1000개씩 분할)
+        
+        Args:
+            start_time: 시작 시간
+            total_count: 총 필요 개수
+            
+        Returns:
+            [{'start_time': datetime, 'count': int}] 리스트
+        """
+        chunks = []
+        current_start = start_time
+        remaining = total_count
+        
+        while remaining > 0:
+            chunk_size = min(remaining, 1000)  # 바이낸스 제한
+            
+            chunks.append({
+                'start_time': current_start,
+                'count': chunk_size
+            })
+            
+            current_start += timedelta(minutes=chunk_size)
+            remaining -= chunk_size
+        
+        logger.debug(f"수집 청크 생성: {len(chunks)}개 청크, 총 {total_count}개")
+        return chunks
+    
+    def get_latest_timestamp(self, symbol: str) -> Optional[datetime]:
+        """
+        해당 심볼의 최신 타임스탬프 조회 (간단 버전)
+        
+        Args:
+            symbol: 거래 심볼
+            
+        Returns:
+            최신 타임스탬프 또는 None
+        """
+        try:
+            response = self.client.table('market_data').select(
+                'timestamp'
+            ).eq('symbol', symbol).order(
+                'timestamp', desc=True
+            ).limit(1).execute()
+            
+            if response.data:
+                return datetime.fromisoformat(
+                    response.data[0]['timestamp'].replace('Z', '+00:00')
+                ).replace(tzinfo=None)
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"최신 타임스탬프 조회 실패: {e}")
+            return None
+
     # ===========================================
     # 거래 및 트레이더 관련 메서드
     # ===========================================
@@ -409,8 +599,12 @@ class SupabaseClient:
             trade_record = {
                 'trader_id': trader_id,
                 **trade_data,
-                'created_at': datetime.now().isoformat()
+                'created_at': self._datetime_to_string(datetime.now())
             }
+            
+            # executed_at이 datetime 객체인 경우 변환
+            if 'executed_at' in trade_record and isinstance(trade_record['executed_at'], datetime):
+                trade_record['executed_at'] = self._datetime_to_string(trade_record['executed_at'])
             
             response = self.client.table('trades').insert(trade_record).execute()
             return len(response.data) > 0
@@ -424,7 +618,7 @@ class SupabaseClient:
         try:
             response = self.client.table('traders').update({
                 'total_pnl': total_pnl,
-                'updated_at': datetime.now().isoformat()
+                'updated_at': self._datetime_to_string(datetime.now())
             }).eq('id', trader_id).execute()
             
             return len(response.data) > 0

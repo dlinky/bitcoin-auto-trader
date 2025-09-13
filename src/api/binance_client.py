@@ -6,36 +6,59 @@ from binance.exceptions import BinanceAPIException, BinanceRequestException
 import pandas as pd
 from decimal import Decimal, ROUND_DOWN
 from src.utils.logger import get_logger
+from datetime import datetime, timedelta
 
 logger = get_logger(__name__)
 
+try:
+    from binance.um_futures import UMFutures  # 최신 버전
+except ImportError:
+    try:
+        from binance.futures import BinanceFuturesClient as UMFutures  # 구버전
+    except ImportError:
+        from binance.client import Client as UMFutures  # fallback
+
 class BinanceClient:
-    """바이낸스 선물 거래를 위한 클라이언트"""
-    
-    def __init__(self, api_key: str, secret_key: str, testnet: bool = True):
+    def __init__(self, api_key: str, secret_key: str, testnet: bool = False):
         """
-        바이낸스 클라이언트 초기화
+        BinanceClient 초기화
         
         Args:
             api_key: API 키
-            secret_key: 시크릿 키  
+            secret_key: API 시크릿
             testnet: 테스트넷 사용 여부
         """
         self.api_key = api_key
         self.secret_key = secret_key
         self.testnet = testnet
         
-        # 바이낸스 클라이언트 초기화
+        # 현물 클라이언트 (기존)
         self.client = Client(
             api_key=api_key,
             api_secret=secret_key,
             testnet=testnet
         )
         
-        # 타임아웃 설정 (5초)
-        self.client.session.timeout = 5
-        
-        logger.info(f"BinanceClient 초기화 완료 (testnet: {testnet})")
+        # 선물 클라이언트 추가
+        try:
+            if hasattr(UMFutures, '__call__'):  # UMFutures가 클래스인 경우
+                self.futures_client = UMFutures(
+                    api_key=api_key,
+                    api_secret=secret_key,
+                    base_url='https://testnet.binancefuture.com' if testnet else 'https://fapi.binance.com'
+                )
+            else:  # fallback to regular Client
+                self.futures_client = Client(
+                    api_key=api_key,
+                    api_secret=secret_key,
+                    testnet=testnet
+                )
+            
+            logger.info(f"BinanceClient 초기화 완료 (testnet: {testnet}) - 현물 + 선물 클라이언트")
+            
+        except Exception as e:
+            logger.warning(f"선물 클라이언트 초기화 실패, 현물 클라이언트만 사용: {e}")
+            self.futures_client = self.client
     
     def _retry_request(self, func, *args, **kwargs):
         """
@@ -104,6 +127,201 @@ class BinanceClient:
         logger.debug(f"캔들 데이터 조회 완료: {symbol} {len(df)}개")
         return df
     
+    def get_klines_bulk(self, symbol: str, interval: str = '1m', 
+                       start_time: datetime = None, end_time: datetime = None,
+                       total_count: int = None) -> pd.DataFrame:
+        """
+        대용량 캔들 데이터 수집 (시간 범위 기반, 수정된 버전)
+        
+        Args:
+            symbol: 거래 심볼
+            interval: 시간 간격 ('1m', '5m', '1h' 등)
+            start_time: 시작 시간 (None이면 현재에서 역산)
+            end_time: 종료 시간 (None이면 현재)
+            total_count: 총 필요 개수 (None이면 시간 범위로 계산)
+            
+        Returns:
+            전체 캔들 데이터 DataFrame
+        """
+        import time
+        
+        try:
+            # 시간 범위 설정
+            if end_time is None:
+                end_time = datetime.now()
+            
+            if start_time is None and total_count is not None:
+                # 개수 기반으로 시작 시간 계산
+                if interval == '1m':
+                    start_time = end_time - timedelta(minutes=total_count)
+                elif interval == '5m':
+                    start_time = end_time - timedelta(minutes=total_count * 5)
+                elif interval == '1h':
+                    start_time = end_time - timedelta(hours=total_count)
+                else:
+                    raise ValueError(f"지원하지 않는 interval: {interval}")
+            
+            if start_time is None:
+                raise ValueError("start_time 또는 total_count 중 하나는 필수입니다")
+            
+            logger.info(f"{symbol} 대용량 데이터 수집: {start_time} ~ {end_time}")
+            
+            all_data = []
+            current_start = start_time
+            batch_count = 0
+            max_limit = 1000  # 바이낸스 제한
+            
+            while current_start < end_time:
+                batch_count += 1
+                
+                # API 호출 제한 준수
+                time.sleep(0.1)  # 100ms 대기
+                
+                # 배치 종료 시간 계산
+                if interval == '1m':
+                    batch_end = min(current_start + timedelta(minutes=max_limit-1), end_time)
+                elif interval == '5m':
+                    batch_end = min(current_start + timedelta(minutes=(max_limit-1)*5), end_time)
+                elif interval == '1h':
+                    batch_end = min(current_start + timedelta(hours=max_limit-1), end_time)
+                
+                logger.debug(f"배치 {batch_count}: {current_start} ~ {batch_end}")
+                
+                # 시간 범위 기반 조회 사용
+                batch_df = self.get_klines_by_time_range(
+                    symbol=symbol,
+                    interval=interval,
+                    start_time=current_start,
+                    end_time=batch_end,
+                    max_count=max_limit
+                )
+                
+                if batch_df.empty:
+                    logger.debug(f"배치 {batch_count}: 데이터 없음")
+                    break
+                
+                all_data.append(batch_df)
+                logger.debug(f"배치 {batch_count}: {len(batch_df)}개 (누적: {sum(len(df) for df in all_data)}개)")
+                
+                # 다음 배치 시작점 설정
+                current_start = batch_df['timestamp'].max() + timedelta(minutes=1)
+                
+                # 진행상황 로깅 (매 10배치마다)
+                if batch_count % 10 == 0:
+                    total_collected = sum(len(df) for df in all_data)
+                    logger.info(f"{symbol} 수집 진행: {total_collected}개 ({batch_count}번의 API 호출)")
+            
+            # 전체 데이터 결합
+            if all_data:
+                result_df = pd.concat(all_data, ignore_index=True)
+                
+                # 시간순 정렬 (오래된 것부터)
+                result_df = result_df.sort_values('timestamp').reset_index(drop=True)
+                
+                # 중복 제거 (같은 시간의 캔들이 있을 수 있음)
+                result_df = result_df.drop_duplicates(subset=['timestamp']).reset_index(drop=True)
+                
+                logger.info(f"{symbol} 대용량 수집 완료: {len(result_df)}개 ({batch_count}번의 API 호출)")
+                return result_df
+            else:
+                logger.warning(f"{symbol} 수집된 데이터 없음")
+                return pd.DataFrame()
+        
+        except Exception as e:
+            logger.error(f"{symbol} 대용량 수집 실패: {e}")
+            return pd.DataFrame()
+    
+    def get_klines_by_count(self, symbol: str, interval: str = '1m', count: int = 200) -> pd.DataFrame:
+        """
+        개수 기반 캔들 데이터 수집 (대용량 지원)
+        
+        Args:
+            symbol: 거래 심볼
+            interval: 시간 간격
+            count: 필요한 캔들 개수
+            
+        Returns:
+            캔들 데이터 DataFrame
+        """
+        if count <= 1000:
+            # 1000개 이하면 기존 메서드 사용
+            return self.get_klines(symbol, interval, count)
+        else:
+            # 1000개 초과면 대용량 수집 사용
+            return self.get_klines_bulk(symbol, interval, total_count=count)
+    
+    def get_klines_by_time_range(self, symbol: str, interval: str, 
+                                start_time: datetime, end_time: datetime) -> pd.DataFrame:
+        """
+        시간 범위 기반 캔들 데이터 조회 (선물 우선, 현물 fallback)
+        """
+        try:
+            # 1차: 선물 클라이언트로 시도
+            try:
+                if hasattr(self.futures_client, 'klines'):
+                    # UMFutures 방식
+                    klines = self.futures_client.klines(
+                        symbol=symbol,
+                        interval=interval,
+                        startTime=int(start_time.timestamp() * 1000),
+                        endTime=int(end_time.timestamp() * 1000),
+                        limit=1000
+                    )
+                else:
+                    # 기존 Client 방식
+                    klines = self.futures_client.futures_klines(
+                        symbol=symbol,
+                        interval=interval,
+                        startTime=int(start_time.timestamp() * 1000),
+                        endTime=int(end_time.timestamp() * 1000),
+                        limit=1000
+                    )
+                
+                logger.debug(f"{symbol} 선물 API로 {len(klines)}개 조회 성공")
+                
+            except Exception as futures_error:
+                logger.warning(f"{symbol} 선물 API 실패, 현물 API 시도: {futures_error}")
+                
+                # 2차: 현물 클라이언트로 시도
+                klines = self.client.get_klines(
+                    symbol=symbol,
+                    interval=interval,
+                    startTime=int(start_time.timestamp() * 1000),
+                    endTime=int(end_time.timestamp() * 1000),
+                    limit=1000
+                )
+                
+                logger.debug(f"{symbol} 현물 API로 {len(klines)}개 조회 성공")
+            
+            if not klines:
+                logger.warning(f"{symbol} 캔들 데이터 없음")
+                return pd.DataFrame()
+            
+            # DataFrame 변환
+            df = pd.DataFrame(klines, columns=[
+                'timestamp', 'open', 'high', 'low', 'close', 'volume',
+                'close_time', 'quote_asset_volume', 'number_of_trades',
+                'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
+            ])
+            
+            # 데이터 타입 변환
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df['open'] = df['open'].astype(float)
+            df['high'] = df['high'].astype(float)
+            df['low'] = df['low'].astype(float) 
+            df['close'] = df['close'].astype(float)
+            df['volume'] = df['volume'].astype(float)
+            
+            # 필요한 컬럼만 선택
+            df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+            
+            logger.info(f"{symbol} 시간 범위 조회 완료: {len(df)}개")
+            return df
+            
+        except Exception as e:
+            logger.error(f"{symbol} 시간 범위 조회 실패: {e}")
+            return pd.DataFrame()
+
     def get_position_info(self, symbol: str) -> Dict:
         """
         포지션 정보 조회

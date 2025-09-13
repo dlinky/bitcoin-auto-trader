@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-데이터 수집 및 지표 계산 모듈
+데이터 수집 및 지표 계산 모듈 (다중 심볼 지원 수정)
 파일 위치: src/core/data_collector.py
 """
 
@@ -16,26 +16,51 @@ from src.utils.logger import get_logger
 logger = get_logger(__name__)
 
 class DataCollector:
-    """시장 데이터 수집 및 지표 계산"""
+    """시장 데이터 수집 및 지표 계산 (다중 심볼 지원)"""
     
-    def __init__(self, binance_client, supabase_client, symbols: List[str] = ['BTCUSDT']):
+    def __init__(self, binance_client, supabase_client, symbols: Optional[List[str]] = None):
         """
         DataCollector 초기화
         
         Args:
             binance_client: BinanceClient 인스턴스
             supabase_client: SupabaseClient 인스턴스
-            symbols: 수집할 심볼 리스트
+            symbols: 수집할 심볼 리스트 (None이면 기본값 사용)
         """
         self.binance_client = binance_client
         self.db_client = supabase_client
-        self.symbols = symbols
         
-        logger.info(f"DataCollector 초기화 완료 - 대상 심볼: {symbols}")
+        # 심볼 설정 (하드코딩 제거)
+        if symbols is None:
+            # 기본 심볼 목록
+            self.symbols = ['BTCUSDT']
+            logger.info("기본 심볼 사용: ['BTCUSDT']")
+        else:
+            self.symbols = symbols
+            logger.info(f"사용자 지정 심볼: {symbols}")
+        
+        logger.info(f"DataCollector 초기화 완료 - 대상 심볼: {self.symbols}")
+    
+    def add_symbol(self, symbol: str):
+        """심볼 추가"""
+        if symbol not in self.symbols:
+            self.symbols.append(symbol)
+            logger.info(f"심볼 추가: {symbol}, 현재 심볼 목록: {self.symbols}")
+    
+    def remove_symbol(self, symbol: str):
+        """심볼 제거"""
+        if symbol in self.symbols:
+            self.symbols.remove(symbol)
+            logger.info(f"심볼 제거: {symbol}, 현재 심볼 목록: {self.symbols}")
+    
+    def set_symbols(self, symbols: List[str]):
+        """심볼 목록 설정"""
+        self.symbols = symbols
+        logger.info(f"심볼 목록 변경: {symbols}")
     
     def ensure_historical_data(self, symbol: str, required_count: int = 200) -> bool:
         """
-        과거 데이터 보완 (프로그램 시작시 실행)
+        과거 데이터 보완 (새로운 효율적 방식)
         
         Args:
             symbol: 거래 심볼
@@ -47,32 +72,156 @@ class DataCollector:
         try:
             logger.info(f"{symbol} 과거 데이터 보완 시작 (필요: {required_count}개)")
             
-            # 누락된 시간 구간 확인
-            missing_ranges = self.db_client.get_missing_time_ranges(symbol, required_count)
+            # 효율적인 수집 전략 얻기
+            strategy = self.db_client.get_collection_strategy(symbol, required_count)
             
-            if not missing_ranges:
-                logger.info(f"{symbol} 모든 과거 데이터 존재")
+            logger.info(f"{symbol} 수집 전략: {strategy['strategy']}, "
+                       f"기존: {strategy['existing_count']}개, "
+                       f"필요: {strategy['total_needed']}개")
+            
+            if strategy['strategy'] == 'up_to_date':
+                logger.info(f"{symbol} 데이터가 최신 상태")
                 return True
             
-            logger.info(f"{symbol} 누락 구간 {len(missing_ranges)}개 발견")
-            
-            # 각 누락 구간별로 데이터 수집
+            # 청크별 데이터 수집
             total_collected = 0
-            for i, (start_time, end_time) in enumerate(missing_ranges, 1):
-                logger.info(f"{symbol} 누락 구간 {i}/{len(missing_ranges)} 처리: {start_time} ~ {end_time}")
+            
+            for i, chunk in enumerate(strategy['chunks'], 1):
+                logger.info(f"{symbol} 청크 {i}/{len(strategy['chunks'])} 수집: "
+                           f"{chunk['start_time']} ({chunk['count']}개)")
                 
-                # 해당 구간 데이터 수집 및 처리
-                collected_count = self._collect_candles_by_range(symbol, start_time, end_time)
+                collected_count = self._collect_chunk(symbol, chunk['start_time'], chunk['count'])
                 total_collected += collected_count
                 
-                logger.debug(f"{symbol} 구간 처리 완료: {collected_count}개")
+                logger.debug(f"{symbol} 청크 {i} 완료: {collected_count}개")
+                
+                # 청크 간 간격 (API 제한 방지)
+                if i < len(strategy['chunks']):
+                    time.sleep(0.1)
             
             logger.info(f"{symbol} 과거 데이터 보완 완료: {total_collected}개 수집")
-            return True
+            return total_collected > 0
             
         except Exception as e:
             logger.error(f"{symbol} 과거 데이터 보완 실패: {e}")
             return False
+    
+    def _collect_chunk(self, symbol: str, start_time: datetime, count: int) -> int:
+        """
+        특정 시작점에서 지정된 개수만큼 수집 (근본적 수정)
+        
+        Args:
+            symbol: 거래 심볼
+            start_time: 시작 시간
+            count: 수집할 개수
+            
+        Returns:
+            실제 수집된 개수
+        """
+        try:
+            end_time = start_time + timedelta(minutes=count-1)
+            
+            logger.debug(f"{symbol} 청크 수집: {start_time} ~ {end_time} ({count}개)")
+            
+            # 시간 범위 기반 수집 사용
+            if count <= 1000:
+                # 1000개 이하면 단일 호출
+                df = self.binance_client.get_klines_by_time_range(
+                    symbol=symbol,
+                    interval='1m',
+                    start_time=start_time,
+                    end_time=end_time
+                )
+            else:
+                # 1000개 초과면 대용량 수집
+                df = self.binance_client.get_klines_bulk(
+                    symbol=symbol,
+                    interval='1m',
+                    start_time=start_time,
+                    end_time=end_time
+                )
+            
+            if df.empty:
+                logger.warning(f"{symbol} 청크 데이터 없음: {start_time} ~ {end_time}")
+                return 0
+            
+            logger.debug(f"{symbol} 청크 수집 완료: {len(df)}개")
+            
+            # 지표 계산
+            indicators_data = self._calculate_indicators_for_df(df, symbol)
+            
+            # DB 저장용 데이터 변환
+            candles_with_indicators = []
+            for _, row in df.iterrows():
+                candle_data = {
+                    'symbol': symbol,
+                    'timestamp': row['timestamp'],
+                    'open': row['open'],
+                    'high': row['high'],
+                    'low': row['low'],
+                    'close': row['close'],
+                    'volume': row['volume']
+                }
+                
+                # 지표 값 추가
+                if row['timestamp'] in indicators_data:
+                    candle_data.update(indicators_data[row['timestamp']])
+                
+                candles_with_indicators.append(candle_data)
+            
+            # DB 저장 (upsert 방식)
+            if candles_with_indicators:
+                logger.info(f"[DATACOLLECTOR] 저장 시도: {len(candles_with_indicators)}개")
+                success = self.db_client.save_market_data_with_retry(candles_with_indicators)
+                logger.info(f"[DATACOLLECTOR] 저장 결과: {success}")
+                if success:
+                    logger.debug(f"{symbol} 청크 저장 완료: {len(candles_with_indicators)}개")
+                    return len(candles_with_indicators)
+                else:
+                    logger.error(f"[DATACOLLECTOR] {symbol} 청크 저장 실패")
+                    return 0
+            
+            return 0
+            
+        except Exception as e:
+            logger.error(f"{symbol} 청크 수집 실패: {e}")
+            return 0
+    
+    def ensure_historical_data_all_symbols(self, required_count: int = 200) -> Dict[str, bool]:
+        """
+        모든 심볼의 과거 데이터 보완
+        
+        Args:
+            required_count: 필요한 캔들 개수
+            
+        Returns:
+            심볼별 보완 성공 여부
+        """
+        results = {}
+        
+        logger.info(f"전체 심볼 과거 데이터 보완 시작: {self.symbols}")
+        
+        for symbol in self.symbols:
+            try:
+                success = self.ensure_historical_data(symbol, required_count)
+                results[symbol] = success
+                
+                if success:
+                    logger.info(f"{symbol} 과거 데이터 보완 성공")
+                else:
+                    logger.error(f"{symbol} 과거 데이터 보완 실패")
+                    
+                # 심볼 간 간격 (API 제한 방지)
+                time.sleep(0.5)
+                
+            except Exception as e:
+                logger.error(f"{symbol} 과거 데이터 보완 중 에러: {e}")
+                results[symbol] = False
+        
+        success_count = sum(results.values())
+        logger.info(f"전체 과거 데이터 보완 완료: {success_count}/{len(self.symbols)}개 성공")
+        
+        return results
     
     def collect_latest_data(self, symbol: str) -> bool:
         """
@@ -107,6 +256,18 @@ class DataCollector:
         except Exception as e:
             logger.error(f"{symbol} 최신 데이터 수집 중 에러: {e}")
             return False
+    
+    def collect_latest_data_for_symbol(self, symbol: str) -> bool:
+        """
+        특정 심볼의 최신 데이터 수집 (외부 호출용)
+        
+        Args:
+            symbol: 거래 심볼
+            
+        Returns:
+            수집 성공 여부
+        """
+        return self.collect_latest_data(symbol)
     
     def collect_all_symbols_concurrent(self) -> Dict[str, bool]:
         """
@@ -167,9 +328,41 @@ class DataCollector:
             logger.error(f"전체 심볼 수집 중 에러: {e}")
             return {symbol: False for symbol in self.symbols}
     
+    def collect_specific_symbols(self, symbols: List[str]) -> Dict[str, bool]:
+        """
+        특정 심볼들의 최신 데이터 수집
+        
+        Args:
+            symbols: 수집할 심볼 리스트
+            
+        Returns:
+            심볼별 수집 성공 여부
+        """
+        results = {}
+        
+        try:
+            logger.info(f"특정 심볼 데이터 수집: {symbols}")
+            
+            for symbol in symbols:
+                success = self.collect_latest_data(symbol)
+                results[symbol] = success
+                
+                # 심볼 간 간격 (API 제한 방지)
+                if len(symbols) > 1:
+                    time.sleep(0.1)
+            
+            success_count = sum(results.values())
+            logger.info(f"특정 심볼 수집 완료: {success_count}/{len(symbols)}개 성공")
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"특정 심볼 수집 중 에러: {e}")
+            return {symbol: False for symbol in symbols}
+    
     def _collect_candles_by_range(self, symbol: str, start_time: datetime, end_time: datetime) -> int:
         """
-        특정 시간 구간의 캔들 데이터 수집
+        특정 시간 구간의 캔들 데이터 수집 (get_klines_by_count 사용)
         
         Args:
             symbol: 거래 심볼
@@ -181,20 +374,20 @@ class DataCollector:
         """
         try:
             # 필요한 캔들 개수 계산
-            minutes_needed = int((end_time - start_time).total_seconds() / 60) + 1
+            total_minutes = int((end_time - start_time).total_seconds() / 60) + 1
+            logger.info(f"{symbol} 구간 수집 시작: {start_time} ~ {end_time} ({total_minutes}분)")
             
-            # 바이낸스에서 해당 구간 데이터 수집
-            # 바이낸스는 최대 1000개까지 한번에 조회 가능
-            limit = min(minutes_needed, 1000)
+            # 기존: get_klines (1000개 제한)
+            # df = self.binance_client.get_klines(symbol, '1m', limit)
             
-            # 종료 시간 기준으로 역순 조회
-            df = self.binance_client.get_klines(symbol, '1m', limit)
+            # 수정: get_klines_by_count (자동 대용량 처리)
+            df = self.binance_client.get_klines_by_count(symbol, '1m', total_minutes)
             
             if df.empty:
                 logger.warning(f"{symbol} 구간 데이터 없음: {start_time} ~ {end_time}")
                 return 0
             
-            # 해당 시간 구간에 해당하는 데이터만 필터링
+            # 시간 범위 필터링 (정확한 범위만)
             df = df[
                 (df['timestamp'] >= start_time) & 
                 (df['timestamp'] <= end_time)
@@ -203,6 +396,8 @@ class DataCollector:
             if df.empty:
                 logger.warning(f"{symbol} 필터링 후 데이터 없음: {start_time} ~ {end_time}")
                 return 0
+            
+            logger.info(f"{symbol} 구간 수집 완료: {len(df)}개")
             
             # 지표 계산
             indicators_data = self._calculate_indicators_for_df(df, symbol)
@@ -239,7 +434,7 @@ class DataCollector:
     
     def _collect_and_calculate_with_retry(self, symbol: str, limit: int = 200) -> Optional[List[Dict]]:
         """
-        데이터 수집 및 지표 계산 (재시도 포함)
+        데이터 수집 및 지표 계산 (get_klines_by_count 사용)
         
         Args:
             symbol: 거래 심볼
@@ -250,8 +445,11 @@ class DataCollector:
         """
         for attempt in range(2):  # 2회 시도
             try:
-                # 바이낸스에서 데이터 수집
-                df = self.binance_client.get_klines(symbol, '1m', limit)
+                # 기존: get_klines (1000개 제한)
+                # df = self.binance_client.get_klines(symbol, '1m', limit)
+                
+                # 수정: get_klines_by_count (자동 대용량 처리)
+                df = self.binance_client.get_klines_by_count(symbol, '1m', limit)
                 
                 if df.empty:
                     raise ValueError(f"{symbol} 캔들 데이터가 없습니다")
@@ -259,7 +457,7 @@ class DataCollector:
                 # 지표 계산용으로 더 많은 데이터 필요한 경우
                 if limit < 50 and len(df) < 50:
                     # 최신 데이터 계산을 위해 200개 데이터로 지표 계산
-                    df_for_indicators = self.binance_client.get_klines(symbol, '1m', 200)
+                    df_for_indicators = self.binance_client.get_klines_by_count(symbol, '1m', 200)
                     indicators_data = self._calculate_indicators_for_df(df_for_indicators, symbol)
                     
                     # 원래 요청한 개수만큼만 반환 데이터 준비
@@ -371,3 +569,11 @@ class DataCollector:
         except Exception as e:
             logger.error(f"{symbol} 지표 계산 실패: {e}")
             return {}
+    
+    def get_symbols(self) -> List[str]:
+        """현재 설정된 심볼 목록 반환"""
+        return self.symbols.copy()
+    
+    def get_symbol_count(self) -> int:
+        """현재 설정된 심볼 개수 반환"""
+        return len(self.symbols)

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Slack 클라이언트 모듈
+Slack 클라이언트 모듈 (명령어 처리 기능 추가)
 파일 위치: src/api/slack_client.py
 """
 
@@ -8,15 +8,17 @@ import os
 import json
 import requests
 import time
-from typing import Dict, Optional, List
+import threading
+from typing import Dict, Optional, List, Callable
 from datetime import datetime
 
 from src.utils.logger import get_logger
+from src.core.slack_command_handler import SlackCommandHandler
 
 logger = get_logger(__name__)
 
 class SlackClient:
-    """Slack API 연동 클라이언트"""
+    """Slack API 연동 클라이언트 (확장 버전)"""
     
     def __init__(self, bot_token: Optional[str] = None, channel_id: Optional[str] = None):
         """
@@ -37,6 +39,15 @@ class SlackClient:
             "Authorization": f"Bearer {self.bot_token}",
             "Content-Type": "application/json"
         }
+        
+        # 명령어 처리 관련
+        self.command_handler = None
+        self.is_listening = False
+        self.listen_thread = None
+        
+        # RTM (Real Time Messaging) 관련
+        self.rtm_url = None
+        self.last_ts = None
         
         # 연결 테스트
         if not self._test_connection():
@@ -68,6 +79,194 @@ class SlackClient:
         except Exception as e:
             logger.error(f"Slack 연결 테스트 중 에러: {e}")
             return False
+    
+    def setup_command_handler(self, supabase_client, notification_manager=None):
+        """
+        명령어 처리기 설정
+        
+        Args:
+            supabase_client: SupabaseClient 인스턴스
+            notification_manager: NotificationManager 인스턴스
+        """
+        try:
+            self.command_handler = SlackCommandHandler(supabase_client, notification_manager)
+            logger.info("Slack 명령어 처리기 설정 완료")
+            
+        except Exception as e:
+            logger.error(f"명령어 처리기 설정 실패: {e}")
+    
+    def start_listening(self) -> bool:
+        """
+        Slack 메시지 수신 시작
+        
+        Returns:
+            시작 성공 여부
+        """
+        try:
+            if self.is_listening:
+                logger.warning("이미 메시지 수신 중입니다")
+                return True
+            
+            if not self.command_handler:
+                logger.error("명령어 처리기가 설정되지 않았습니다")
+                return False
+            
+            self.is_listening = True
+            self.listen_thread = threading.Thread(
+                target=self._message_listener,
+                name="SlackMessageListener",
+                daemon=True
+            )
+            self.listen_thread.start()
+            
+            logger.info("Slack 메시지 수신 시작")
+            return True
+            
+        except Exception as e:
+            logger.error(f"메시지 수신 시작 실패: {e}")
+            return False
+    
+    def stop_listening(self):
+        """Slack 메시지 수신 중지"""
+        try:
+            if not self.is_listening:
+                logger.info("메시지 수신이 이미 중지된 상태입니다")
+                return
+            
+            logger.info("Slack 메시지 수신 중지 중...")
+            self.is_listening = False
+            
+            if self.listen_thread and self.listen_thread.is_alive():
+                self.listen_thread.join(timeout=5)
+            
+            logger.info("Slack 메시지 수신 중지 완료")
+            
+        except Exception as e:
+            logger.error(f"메시지 수신 중지 중 에러: {e}")
+    
+    def _message_listener(self):
+        """메시지 수신 스레드"""
+        logger.info("Slack 메시지 수신 스레드 시작")
+        
+        while self.is_listening:
+            try:
+                # Conversations API를 사용한 폴링 방식
+                messages = self._get_recent_messages()
+                
+                for message in messages:
+                    self._process_message(message)
+                
+                # 1초마다 체크 (부하 방지)
+                time.sleep(1)
+                
+            except Exception as e:
+                logger.error(f"메시지 수신 중 에러: {e}")
+                time.sleep(5)  # 에러 시 5초 대기
+        
+        logger.info("Slack 메시지 수신 스레드 종료")
+    
+    def _get_recent_messages(self) -> List[Dict]:
+        """최근 메시지 조회"""
+        try:
+            params = {
+                'channel': self.channel_id,
+                'limit': 10
+            }
+            
+            # 마지막 처리한 타임스탬프 이후 메시지만 조회
+            if self.last_ts:
+                params['oldest'] = self.last_ts
+            
+            response = requests.get(
+                f"{self.base_url}/conversations.history",
+                headers=self.headers,
+                params=params,
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("ok"):
+                    messages = data.get("messages", [])
+                    
+                    # 타임스탬프 업데이트
+                    if messages:
+                        self.last_ts = messages[0].get("ts")
+                    
+                    # 봇 자신의 메시지는 제외
+                    bot_messages = [msg for msg in messages if msg.get("user") != "bot_user"]
+                    return bot_messages
+                else:
+                    logger.error(f"메시지 조회 실패: {data.get('error')}")
+                    return []
+            else:
+                logger.error(f"메시지 조회 API 실패: HTTP {response.status_code}")
+                return []
+                
+        except Exception as e:
+            logger.error(f"메시지 조회 중 에러: {e}")
+            return []
+    
+    def _process_message(self, message: Dict):
+        """메시지 처리"""
+        try:
+            text = message.get("text", "").strip()
+            user = message.get("user", "")
+            ts = message.get("ts", "")
+            
+            # 빈 메시지나 이미 처리한 메시지 무시
+            if not text or not user:
+                return
+            
+            # 봇에게 보내는 명령어 확인 (@봇이름 또는 /로 시작)
+            if self._is_command_message(text):
+                logger.info(f"명령어 감지: {text} (사용자: {user})")
+                
+                # 명령어 처리
+                result = self.command_handler.process_command(text, user)
+                
+                # 응답 전송
+                if result:
+                    # 스레드로 응답 (원본 메시지에 대한 답글)
+                    self.send_message(
+                        text=result.message,
+                        thread_ts=ts
+                    )
+                    
+                    logger.info(f"명령어 응답 완료: {result.success}")
+                else:
+                    logger.error("명령어 처리 결과를 받지 못했습니다")
+            
+        except Exception as e:
+            logger.error(f"메시지 처리 중 에러: {e}")
+    
+    def _is_command_message(self, text: str) -> bool:
+        """명령어 메시지인지 확인"""
+        if not text:
+            return False
+        
+        text = text.strip().lower()
+        
+        # 봇 멘션으로 시작 (@botname)
+        if text.startswith('<@'):
+            return True
+        
+        # 커스텀 접두사들
+        prefixes = ['/', '!', '.', 'bot ', 'trader ']
+        for prefix in prefixes:
+            if text.startswith(prefix):
+                return True
+        
+        # 일반 명령어 (접두사 없이)
+        first_word = text.split()[0]
+        common_commands = [
+            'status', 'help', 'position', 'pnl', 'stop', 'start', 
+            'traders', 'report', '상태', '도움', '포지션', '수익'
+        ]
+        
+        return first_word in common_commands
+    
+    # 기존 메서드들 (send_message, send_error_alert 등은 동일하게 유지)
     
     def send_message(self, text: str, channel: Optional[str] = None, 
                     blocks: Optional[List[Dict]] = None, thread_ts: Optional[str] = None) -> bool:
@@ -197,20 +396,6 @@ class SlackClient:
         
         Args:
             report_data: 리포트 데이터
-            {
-                'date': '2025-01-15',
-                'traders': [
-                    {
-                        'name': 'BTC_MACD_Trader_1',
-                        'symbol': 'BTCUSDT',
-                        'total_pnl': 123.45,
-                        'trades_count': 5,
-                        'success_rate': 60.0
-                    }
-                ],
-                'total_pnl': 123.45,
-                'total_trades': 5
-            }
             
         Returns:
             전송 성공 여부
@@ -301,13 +486,6 @@ class SlackClient:
         
         Args:
             status_data: 상태 데이터
-            {
-                'system_status': 'running',  # running, stopped, error
-                'uptime': '2 days 3 hours',
-                'active_traders': 1,
-                'last_trade': '2025-01-15 14:30:00',
-                'errors_today': 2
-            }
             
         Returns:
             전송 성공 여부

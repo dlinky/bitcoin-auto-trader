@@ -100,11 +100,14 @@ class Backtester:
             # 데이터 검증
             if not self._validate_market_data(market_data):
                 raise ValueError("시장 데이터가 유효하지 않습니다")
-            
+
+            # 시장 데이터를 인스턴스 변수로 저장 (중요!)
+            self.market_data = market_data.copy()
+
             # 백테스트 실행
             for i in range(len(market_data)):
                 current_row = market_data.iloc[i]
-                self._process_bar(strategy, current_row, symbol)
+                self._process_bar(strategy, current_row, symbol, i)
             
             # 마지막 포지션 청산
             if self.current_position:
@@ -143,8 +146,8 @@ class Backtester:
         
         return True
     
-    def _process_bar(self, strategy, current_row: pd.Series, symbol: str):
-        """개별 바 처리"""
+    def _process_bar(self, strategy, current_row: pd.Series, symbol: str, current_index: int):
+        """개별 바 처리 (market_data 전달 추가)"""
         try:
             timestamp = current_row['timestamp']
             current_price = current_row['close']
@@ -153,11 +156,22 @@ class Backtester:
             if self.current_position:
                 self._update_unrealized_pnl(current_price)
             
-            # 전략에서 시그널 생성
-            # 현재 포지션 정보를 문자열로 전달 (기존 Trader와 호환)
+            # 전략용 시장 데이터 준비 (현재 시점까지의 데이터)
+            lookback_period = min(100, current_index + 1)
+            start_idx = max(0, current_index + 1 - lookback_period)
+            
+            # 전략에 전달할 market_data 준비
+            market_data_for_strategy = self.market_data.iloc[start_idx:current_index + 1].copy()
+            
+            # 현재 포지션 정보
             position_info = self.current_position.side if self.current_position else None
             
-            signal = strategy.generate_signal(symbol, position_info)
+            # 전략에서 시그널 생성 (market_data 명시적 전달) ← 핵심!
+            signal = strategy.generate_signal(
+                symbol=symbol, 
+                current_position=position_info,
+                market_data=market_data_for_strategy
+            )
             
             # 시그널 처리
             if signal['signal'] in ['ENTRY_LONG', 'ENTRY_SHORT'] and not self.current_position:

@@ -22,4 +22,21 @@ crypto-auto-trader/
 └── requirements.txt
 
 
+from datetime import datetime
+from src.api.supabase_client import SupabaseClient
+from dotenv import load_dotenv
+import os
 
+load_dotenv('config/.env')
+api_key = os.getenv('BINANCE_API_KEY')
+api_secret = os.getenv('BINANCE_API_SECRET')
+
+client = SupabaseClient()
+
+# 전체 ETHUSDT 데이터 개수
+response = client.client.table('market_data').select('id', count='exact').eq('symbol', 'ETHUSDT').execute()
+print(f"현재 ETHUSDT 총 개수: {response.count}")
+
+# 9월 데이터만 확인
+response = client.client.table('market_data').select('timestamp').eq('symbol', 'ETHUSDT').gte('timestamp', '2025-09-01').execute()
+print(f"9월 데이터 개수: {len(response.data)}")

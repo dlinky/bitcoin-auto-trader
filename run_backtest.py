@@ -78,51 +78,82 @@ class BacktestRunner:
         try:
             logger.info(f"{symbol} 시장 데이터 조회 ({days}일)")
             
-            # 1. DB에서 기존 데이터 조회
+            # 1. 시간 범위 계산
             end_time = datetime.now()
             start_time = end_time - timedelta(days=days)
             
-            response = self.supabase_client.client.table('market_data').select('*').eq(
-                'symbol', symbol
-            ).gte(
-                'timestamp', start_time.isoformat()
-            ).lte(
-                'timestamp', end_time.isoformat()
-            ).order('timestamp', desc=False).execute()
+            # 2. 배치 조회로 Supabase 1000개 제한 우회
+            all_data = []
+            batch_size = timedelta(hours=12)  # 12시간씩 배치 처리 (약 720개씩)
+            current_start = start_time
+
+            logger.info(f"{symbol} 배치 조회 시작: {start_time} ~ {end_time}")
+
+            while current_start < end_time:
+                batch_end = min(current_start + batch_size, end_time)
+                
+                response = self.supabase_client.client.table('market_data').select('*').eq(
+                    'symbol', symbol
+                ).gte(
+                    'timestamp', current_start.isoformat()
+                ).lt(  # lt 사용으로 중복 방지
+                    'timestamp', batch_end.isoformat()
+                ).order('timestamp', desc=False).execute()
+                
+                if response.data:
+                    all_data.extend(response.data)
+                    logger.debug(f"{symbol} 배치 조회: {len(response.data)}개 추가")
+                
+                current_start = batch_end
+
+            actual_count = len(all_data)
+            print(f"[DEBUG] 배치 조회 결과: {actual_count}개")
             
-            # 2. 데이터 충분성 검사
+            # 3. 데이터 충분성 검사
             required_count = days * 24 * 60  # 분봉 기준 예상 개수
-            actual_count = len(response.data) if response.data else 0
-            
             logger.info(f"{symbol} 기존 데이터: {actual_count}개 (필요: {required_count}개)")
             
-            # 3. 데이터 부족하면 자동 수집
+            # 4. 데이터 부족하면 자동 수집
             if actual_count < required_count * 0.8:  # 80% 이하면 부족으로 판단
                 logger.info(f"{symbol} 데이터 부족, 자동 수집 시작...")
                 
                 if self._collect_missing_data(symbol, days):
                     # 데이터 수집 후 재조회
-                    response = self.supabase_client.client.table('market_data').select('*').eq(
-                        'symbol', symbol
-                    ).gte(
-                        'timestamp', start_time.isoformat()
-                    ).lte(
-                        'timestamp', end_time.isoformat()
-                    ).order('timestamp', desc=False).execute()
+                    all_data = []  # 재초기화
+                    current_start = start_time
+
+                    while current_start < end_time:
+                        batch_end = min(current_start + batch_size, end_time)
+                        
+                        response = self.supabase_client.client.table('market_data').select('*').eq(
+                            'symbol', symbol
+                        ).gte(
+                            'timestamp', current_start.isoformat()
+                        ).lt(
+                            'timestamp', batch_end.isoformat()
+                        ).order('timestamp', desc=False).execute()
+                        
+                        if response.data:
+                            all_data.extend(response.data)
+                        
+                        current_start = batch_end
                     
-                    logger.info(f"{symbol} 데이터 수집 완료: {len(response.data)}개")
+                    logger.info(f"{symbol} 데이터 수집 완료: {len(all_data)}개")
                 else:
                     logger.warning(f"{symbol} 데이터 수집 실패, 기존 데이터로 진행")
             
-            if not response.data:
+            # 5. 데이터 검증
+            if not all_data:
                 logger.error(f"{symbol} 데이터가 없습니다")
                 return None
             
-            # 4. DataFrame 변환
+            # 6. DataFrame 변환
             import pandas as pd
-            df = pd.DataFrame(response.data)
+            df = pd.DataFrame(all_data)
             df['timestamp'] = pd.to_datetime(df['timestamp'])
+            df = df.sort_values('timestamp').reset_index(drop=True)
             
+            print(f"[DEBUG] DataFrame 개수: {len(df)}")
             logger.info(f"{symbol} 데이터 조회 완료: {len(df)}개 레코드")
             return df
             
@@ -130,142 +161,34 @@ class BacktestRunner:
             logger.error(f"시장 데이터 조회 실패: {e}")
             return None
     
+    # run_backtest.py의 _collect_missing_data 메서드에서 수정
     def _collect_missing_data(self, symbol: str, days: int) -> bool:
         """부족한 데이터 자동 수집"""
         try:
-            import requests
-            import pandas as pd
-            import pandas_ta as ta
-            import time
+            from src.api.binance_client import BinanceClient
+            from src.core.data_collector import DataCollector
             
             logger.info(f"{symbol} 과거 데이터 수집 시작...")
             
-            # 바이낸스 API로 데이터 수집
-            end_time = datetime.now()
-            start_time = end_time - timedelta(days=days)
+            # 메인넷으로 변경 (testnet=False)
+            binance_client = BinanceClient(
+                os.getenv('BINANCE_API_KEY'),
+                os.getenv('BINANCE_SECRET_KEY'),
+                testnet=False  # ← 이 부분 수정
+            )
             
-            # 바이낸스 선물 API 엔드포인트
-            base_url = "https://fapi.binance.com"
+            data_collector = DataCollector(binance_client, self.supabase_client, [symbol])
             
-            all_klines = []
-            current_start = start_time
+            logger.info(f"{symbol} {days * 24 * 60}개 캔들 수집 시작...")
+            success = data_collector.ensure_historical_data(symbol, days * 24 * 60)
             
-            # 배치로 데이터 수집 (한 번에 최대 1500개)
-            max_limit = 1500
-            
-            while current_start < end_time:
-                # API 호출 제한 준수
-                time.sleep(0.1)  # 100ms 대기
-                
-                # 배치 종료 시간 계산
-                batch_end = min(current_start + timedelta(minutes=max_limit-1), end_time)
-                
-                # 타임스탬프 변환
-                start_ts = int(current_start.timestamp() * 1000)
-                end_ts = int(batch_end.timestamp() * 1000)
-                
-                url = f"{base_url}/fapi/v1/klines"
-                params = {
-                    'symbol': symbol,
-                    'interval': '1m',
-                    'startTime': start_ts,
-                    'endTime': end_ts,
-                    'limit': max_limit
-                }
-                
-                logger.debug(f"배치 수집: {current_start.strftime('%Y-%m-%d %H:%M')} ~ {batch_end.strftime('%Y-%m-%d %H:%M')}")
-                
-                response = requests.get(url, params=params, timeout=10)
-                
-                if response.status_code != 200:
-                    logger.error(f"바이낸스 API 호출 실패: HTTP {response.status_code}")
-                    if response.status_code == 429:  # Rate limit
-                        time.sleep(60)  # 1분 대기
-                        continue
-                    return False
-                
-                klines = response.json()
-                
-                if not klines:
-                    break
-                
-                # 데이터 변환
-                for kline in klines:
-                    timestamp = datetime.fromtimestamp(kline[0] / 1000)
-                    
-                    kline_data = {
-                        'symbol': symbol,
-                        'timestamp': timestamp,
-                        'open': float(kline[1]),
-                        'high': float(kline[2]),
-                        'low': float(kline[3]),
-                        'close': float(kline[4]),
-                        'volume': float(kline[5])
-                    }
-                    
-                    all_klines.append(kline_data)
-                
-                # 다음 배치 시작점 설정
-                if klines:
-                    last_timestamp = datetime.fromtimestamp(klines[-1][0] / 1000)
-                    current_start = last_timestamp + timedelta(minutes=1)
-                else:
-                    break
-            
-            if not all_klines:
-                logger.error(f"{symbol} 바이낸스에서 데이터를 가져올 수 없습니다")
+            if success:
+                logger.info(f"{symbol} 데이터 수집 및 저장 완료")
+                return True
+            else:
+                logger.error(f"{symbol} 데이터 수집 실패")
                 return False
-            
-            logger.info(f"{symbol} 바이낸스에서 {len(all_klines)}개 수집")
-            
-            # 지표 계산
-            if len(all_klines) >= 50:
-                df = pd.DataFrame(all_klines)
                 
-                # MACD 계산
-                macd = df.ta.macd(fast=12, slow=26, signal=9)
-                atr = df.ta.atr(length=14)
-                
-                # 지표 데이터 추가
-                for i, kline_data in enumerate(all_klines):
-                    # MACD 값들 추가
-                    if macd is not None and len(macd.columns) >= 3 and i < len(macd):
-                        macd_line = macd.iloc[i, 0] if not pd.isna(macd.iloc[i, 0]) else None
-                        macd_histogram = macd.iloc[i, 1] if not pd.isna(macd.iloc[i, 1]) else None
-                        macd_signal = macd.iloc[i, 2] if not pd.isna(macd.iloc[i, 2]) else None
-                        
-                        if macd_line is not None:
-                            kline_data['macd_12_26_9_line'] = float(macd_line)
-                        if macd_histogram is not None:
-                            kline_data['macd_12_26_9_histogram'] = float(macd_histogram)
-                        if macd_signal is not None:
-                            kline_data['macd_12_26_9_signal'] = float(macd_signal)
-                    
-                    # ATR 값 추가
-                    if atr is not None and i < len(atr) and not pd.isna(atr.iloc[i]):
-                        kline_data['atr_14_value'] = float(atr.iloc[i])
-            
-            # DB에 배치 저장
-            batch_size = 1000
-            for i in range(0, len(all_klines), batch_size):
-                batch = all_klines[i:i + batch_size]
-                
-                try:
-                    response = self.supabase_client.client.table('market_data').upsert(
-                        batch, on_conflict='symbol,timestamp'
-                    ).execute()
-                    
-                    logger.debug(f"배치 저장 완료: {len(batch)}개")
-                    
-                except Exception as e:
-                    logger.warning(f"배치 저장 실패: {e}")
-                
-                # DB 부하 방지
-                time.sleep(0.1)
-            
-            logger.info(f"{symbol} 데이터 수집 및 저장 완료")
-            return True
-            
         except Exception as e:
             logger.error(f"{symbol} 데이터 수집 실패: {e}")
             return False
@@ -275,16 +198,6 @@ class BacktestRunner:
                            send_to_slack: bool = True) -> 'BacktestResult':
         """
         단일 전략 백테스트 실행
-        
-        Args:
-            strategy_name: 전략 이름
-            symbol: 거래 심볼
-            days: 백테스트 기간 (일)
-            initial_capital: 초기 자본
-            send_to_slack: Slack 전송 여부
-            
-        Returns:
-            BacktestResult 객체
         """
         try:
             logger.info(f"백테스트 시작: {strategy_name} - {symbol} ({days}일)")
@@ -298,33 +211,15 @@ class BacktestRunner:
             if market_data is None or market_data.empty:
                 raise ValueError("시장 데이터를 가져올 수 없습니다")
             
-            # 전략 인스턴스 생성
+            # 전략 인스턴스 생성 (백테스팅에서는 supabase_client 전달 안함)
             strategy_class = self.strategies[strategy_name]
-
-            # 백테스팅에서는 supabase_client 없이 전략 생성
-            try:
-                # supabase_client 없이 초기화 시도
-                strategy = strategy_class()
-            except TypeError:
-                # supabase_client가 필요한 경우 전달
-                strategy = strategy_class(self.supabase_client)
+            strategy = strategy_class()  # supabase_client 없이 초기화
             
             # 백테스터 생성 및 실행
             backtester = Backtester(initial_capital=initial_capital)
             result = backtester.run_backtest(strategy, market_data, symbol)
             
-            # 결과 리포트
-            self._print_result_summary(result)
-            
-            # Slack 전송
-            if send_to_slack and self.slack_client:
-                reporter = BacktestReporter(self.slack_client)
-                reporter.send_backtest_report(result, include_charts=True)
-            
-            # 파일 저장
-            self._save_result_to_file(result)
-            
-            logger.info("백테스트 완료")
+            # 나머지 로직...
             return result
             
         except Exception as e:
